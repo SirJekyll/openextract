@@ -24,6 +24,8 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
   const [password, setPassword] = useState('');
   const [crack, setCrack] = useState<CrackState | null>(null);
   const [crackError, setCrackError] = useState<string | null>(null);
+  const [foundPassword, setFoundPassword] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const crackRef = useRef<CrackState | null>(null);
 
   useEffect(() => {
@@ -44,7 +46,10 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
         const digits = crackRef.current.digits;
         setCrack(null);
         if (p.found && p.password) {
-          onSubmit(p.password);
+          // Show the recovered code rather than silently unlocking with it —
+          // otherwise the user has no way to write it down for next time.
+          setPassword(p.password);
+          setFoundPassword(p.password);
         } else if (!p.cancelled) {
           setCrackError(`No matching ${digits}-digit code found.`);
         }
@@ -79,6 +84,14 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
   const handleStopCrack = () => {
     if (!crack) return;
     sidecarCall('cancel_crack_password', { job_id: crack.jobId }).catch(() => {});
+  };
+
+  const handleCopyFound = () => {
+    if (!foundPassword) return;
+    navigator.clipboard?.writeText(foundPassword).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {});
   };
 
   const percent = crack ? Math.min(100, Math.floor((crack.tried / crack.total) * 100)) : 0;
@@ -121,6 +134,22 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
             <div className="mt-2 text-xs text-apple-error">{error}</div>
           )}
 
+          {foundPassword && (
+            <div className="mt-2 p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-between gap-2">
+              <div className="text-xs text-emerald-800">
+                Found it: <span className="font-mono font-semibold tracking-wide">{foundPassword}</span>
+                <span className="block text-[11px] text-emerald-700 mt-0.5">Save this somewhere — click Unlock to continue.</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleCopyFound}
+                className="text-xs text-emerald-700 hover:underline flex-shrink-0"
+              >
+                {copied ? 'Copied!' : 'Copy'}
+              </button>
+            </div>
+          )}
+
           <div className="flex gap-2 mt-4">
             <button
               type="button"
@@ -146,59 +175,61 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
           </div>
         </form>
 
-        <div className="mt-4 pt-4 border-t border-border-strong">
-          {!crack ? (
-            <>
-              <p className="text-xs text-text-tertiary mb-2">
-                Forgot the password? Try every numeric passcode instead:
-              </p>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => handleCrack(4)}
-                  disabled={loading}
-                  className="flex-1 px-3 py-2 text-xs rounded-lg border border-border-strong text-text-secondary hover:bg-elevated transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  All 4-digit codes
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleCrack(6)}
-                  disabled={loading}
-                  className="flex-1 px-3 py-2 text-xs rounded-lg border border-border-strong text-text-secondary hover:bg-elevated transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  All 6-digit codes
-                </button>
+        {!foundPassword && (
+          <div className="mt-4 pt-4 border-t border-border-strong">
+            {!crack ? (
+              <>
+                <p className="text-xs text-text-tertiary mb-2">
+                  Forgot the password? Try every numeric passcode instead:
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleCrack(4)}
+                    disabled={loading}
+                    className="flex-1 px-3 py-2 text-xs rounded-lg border border-border-strong text-text-secondary hover:bg-elevated transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    All 4-digit codes
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleCrack(6)}
+                    disabled={loading}
+                    className="flex-1 px-3 py-2 text-xs rounded-lg border border-border-strong text-text-secondary hover:bg-elevated transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    All 6-digit codes
+                  </button>
+                </div>
+                {crackError && (
+                  <div className="mt-2 text-xs text-apple-error">{crackError}</div>
+                )}
+              </>
+            ) : (
+              <div>
+                <div className="flex items-center justify-between text-xs text-text-secondary mb-1.5">
+                  <span>Trying {crack.digits}-digit codes… {percent}%</span>
+                  <button
+                    type="button"
+                    onClick={handleStopCrack}
+                    className="text-apple-error hover:underline"
+                  >
+                    Stop
+                  </button>
+                </div>
+                <div className="w-full h-1.5 bg-elevated rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-accent rounded-full transition-all duration-300"
+                    style={{ width: `${Math.max(2, percent)}%` }}
+                  />
+                </div>
+                <p className="text-[11px] text-text-tertiary mt-1.5">
+                  {crack.tried.toLocaleString()} / {crack.total.toLocaleString()} tried
+                  {crack.digits === 6 && ' · this can take a while'}
+                </p>
               </div>
-              {crackError && (
-                <div className="mt-2 text-xs text-apple-error">{crackError}</div>
-              )}
-            </>
-          ) : (
-            <div>
-              <div className="flex items-center justify-between text-xs text-text-secondary mb-1.5">
-                <span>Trying {crack.digits}-digit codes… {percent}%</span>
-                <button
-                  type="button"
-                  onClick={handleStopCrack}
-                  className="text-apple-error hover:underline"
-                >
-                  Stop
-                </button>
-              </div>
-              <div className="w-full h-1.5 bg-elevated rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-accent rounded-full transition-all duration-300"
-                  style={{ width: `${Math.max(2, percent)}%` }}
-                />
-              </div>
-              <p className="text-[11px] text-text-tertiary mt-1.5">
-                {crack.tried.toLocaleString()} / {crack.total.toLocaleString()} tried
-                {crack.digits === 6 && ' · this can take a while'}
-              </p>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
