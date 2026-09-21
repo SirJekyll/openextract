@@ -18,7 +18,12 @@ interface CrackState {
   jobId: string;
   tried: number;
   total: number;
+  /** Which 100k block (0-9) this run covers, for a chunked 6-digit search. */
+  block?: number;
 }
+
+const BLOCK_SIZE = 100_000;
+const NUM_BLOCKS = 10; // 1,000,000 / 100,000
 
 export default function PasswordDialog({ udid, backupDir, deviceName, error, loading, onSubmit, onCancel }: Props) {
   const [password, setPassword] = useState('');
@@ -26,6 +31,8 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
   const [crackError, setCrackError] = useState<string | null>(null);
   const [foundPassword, setFoundPassword] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [showBlockPicker, setShowBlockPicker] = useState(false);
+  const [completedBlocks, setCompletedBlocks] = useState<Set<number>>(new Set());
   const crackRef = useRef<CrackState | null>(null);
 
   useEffect(() => {
@@ -43,7 +50,7 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
       if (p.phase === 'running') {
         setCrack(prev => (prev ? { ...prev, tried: p.tried, total: p.total } : prev));
       } else if (p.phase === 'done') {
-        const digits = crackRef.current.digits;
+        const { digits, block } = crackRef.current;
         setCrack(null);
         if (p.found && p.password) {
           // Show the recovered code rather than silently unlocking with it —
@@ -51,7 +58,14 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
           setPassword(p.password);
           setFoundPassword(p.password);
         } else if (!p.cancelled) {
-          setCrackError(`No matching ${digits}-digit code found.`);
+          setCrackError(
+            block !== undefined
+              ? `No match in block ${block + 1} of ${NUM_BLOCKS}.`
+              : `No matching ${digits}-digit code found.`
+          );
+          if (block !== undefined) {
+            setCompletedBlocks(prev => new Set(prev).add(block));
+          }
         }
       }
     });
@@ -64,21 +78,31 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleCrack = async (digits: 4 | 6) => {
+  const handleCrack = async (digits: 4 | 6, range?: { start: number; count: number; block: number }) => {
     setCrackError(null);
     try {
       const result = await sidecarCall<{ status: string; job_id?: string; total?: number; error?: string }>(
         'crack_password',
-        { udid, digits, backup_dir: backupDir }
+        {
+          udid,
+          digits,
+          backup_dir: backupDir,
+          ...(range ? { start: range.start, count: range.count } : {}),
+        }
       );
       if (result.status === 'started' && result.job_id && result.total) {
-        setCrack({ digits, jobId: result.job_id, tried: 0, total: result.total });
+        setCrack({ digits, jobId: result.job_id, tried: 0, total: result.total, block: range?.block });
+        setShowBlockPicker(false);
       } else {
         setCrackError(result.error || 'Could not start password recovery.');
       }
     } catch (e: any) {
       setCrackError(e.message || 'Could not start password recovery.');
     }
+  };
+
+  const handleSelectBlock = (block: number) => {
+    handleCrack(6, { start: block * BLOCK_SIZE, count: BLOCK_SIZE, block });
   };
 
   const handleStopCrack = () => {
@@ -177,7 +201,43 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
 
         {!foundPassword && (
           <div className="mt-4 pt-4 border-t border-border-strong">
-            {!crack ? (
+            {crack ? null : showBlockPicker ? (
+              <div>
+                <p className="text-xs text-text-tertiary mb-2">
+                  Pick a block of 100,000 codes to search (all ten cover the full 1,000,000):
+                </p>
+                <div className="grid grid-cols-2 gap-1.5 mb-2">
+                  {Array.from({ length: NUM_BLOCKS }, (_, i) => {
+                    const start = i * BLOCK_SIZE;
+                    const end = start + BLOCK_SIZE - 1;
+                    const done = completedBlocks.has(i);
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => handleSelectBlock(i)}
+                        disabled={loading}
+                        className={`px-2 py-2 text-[11px] font-mono rounded-lg border border-border-strong transition-colors hover:bg-elevated disabled:opacity-50 disabled:cursor-not-allowed ${
+                          done ? 'text-text-tertiary' : 'text-text-secondary'
+                        }`}
+                      >
+                        {done && '✓ '}{String(start).padStart(6, '0')}–{String(end).padStart(6, '0')}
+                      </button>
+                    );
+                  })}
+                </div>
+                {crackError && (
+                  <div className="mb-2 text-xs text-apple-error">{crackError}</div>
+                )}
+                <button
+                  type="button"
+                  onClick={() => { setShowBlockPicker(false); setCrackError(null); }}
+                  className="w-full px-3 py-2 text-xs rounded-lg border border-border-strong text-text-secondary hover:bg-elevated transition-colors"
+                >
+                  Back
+                </button>
+              </div>
+            ) : (
               <>
                 <p className="text-xs text-text-tertiary mb-2">
                   Forgot the password? Try every numeric passcode instead:
@@ -193,21 +253,26 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
                   </button>
                   <button
                     type="button"
-                    onClick={() => handleCrack(6)}
+                    onClick={() => { setCrackError(null); setShowBlockPicker(true); }}
                     disabled={loading}
                     className="flex-1 px-3 py-2 text-xs rounded-lg border border-border-strong text-text-secondary hover:bg-elevated transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    All 6-digit codes
+                    6-digit codes
                   </button>
                 </div>
                 {crackError && (
                   <div className="mt-2 text-xs text-apple-error">{crackError}</div>
                 )}
               </>
-            ) : (
+            )}
+            {crack && (
               <div>
                 <div className="flex items-center justify-between text-xs text-text-secondary mb-1.5">
-                  <span>Trying {crack.digits}-digit codes… {percent}%</span>
+                  <span>
+                    {crack.block !== undefined
+                      ? `Trying block ${crack.block + 1} of ${NUM_BLOCKS}… ${percent}%`
+                      : `Trying ${crack.digits}-digit codes… ${percent}%`}
+                  </span>
                   <button
                     type="button"
                     onClick={handleStopCrack}
@@ -224,7 +289,7 @@ export default function PasswordDialog({ udid, backupDir, deviceName, error, loa
                 </div>
                 <p className="text-[11px] text-text-tertiary mt-1.5">
                   {crack.tried.toLocaleString()} / {crack.total.toLocaleString()} tried
-                  {crack.digits === 6 && ' · this can take a while'}
+                  {crack.total >= 500_000 && ' · this can take a while'}
                 </p>
               </div>
             )}

@@ -442,11 +442,18 @@ class BackupManager:
             return False
 
     def crack_password(self, udid: str, digits: int, backup_dir: Optional[str] = None,
+                        start: int = 0, count: Optional[int] = None,
                         notify: Optional[Callable[[dict], None]] = None) -> dict:
         """
-        Start a background brute-force search over every all-numeric password
-        of the given length (4 or 6 digits) for an encrypted backup — useful
-        for recovering a forgotten iOS numeric backup passcode.
+        Start a background brute-force search over all-numeric passwords of
+        the given length (4 or 6 digits) for an encrypted backup — useful for
+        recovering a forgotten iOS numeric backup passcode.
+
+        By default this searches the whole space (0 to 10**digits - 1). Pass
+        `start`/`count` to search only a slice of it — e.g. one of ten
+        100,000-code blocks of the 6-digit space — so a search that would
+        otherwise take a very long time can be run in smaller, resumable
+        chunks instead of one long sitting.
 
         Returns immediately with a job_id; progress and the eventual result
         are streamed through `notify` (one dict per event, see _run_crack_job)
@@ -455,6 +462,12 @@ class BackupManager:
         """
         if digits not in (4, 6):
             return {"status": "error", "error": "Only 4 or 6 digit codes are supported"}
+
+        space = 10 ** digits
+        if count is None:
+            count = space - start
+        if start < 0 or count <= 0 or start + count > space:
+            return {"status": "error", "error": "Invalid search range"}
 
         info, backup_dir = self._resolve_backup_dir_info(udid, backup_dir)
         if not info:
@@ -465,18 +478,17 @@ class BackupManager:
             return {"status": "error", "error": "Decryption library not installed"}
 
         job_id = uuid.uuid4().hex
-        total = 10 ** digits
         cancel_event = threading.Event()
         self._crack_jobs[job_id] = {"cancel": cancel_event}
 
         thread = threading.Thread(
             target=self._run_crack_job,
-            args=(job_id, backup_dir, digits, total, cancel_event, notify),
+            args=(job_id, backup_dir, digits, start, count, cancel_event, notify),
             daemon=True,
         )
         thread.start()
 
-        return {"status": "started", "job_id": job_id, "total": total}
+        return {"status": "started", "job_id": job_id, "total": count}
 
     def cancel_crack_password(self, job_id: str) -> dict:
         """Signal a running crack_password job to stop as soon as possible."""
@@ -486,19 +498,21 @@ class BackupManager:
         job["cancel"].set()
         return {"status": "cancelling"}
 
-    def _run_crack_job(self, job_id: str, backup_dir: str, digits: int, total: int,
+    def _run_crack_job(self, job_id: str, backup_dir: str, digits: int, start: int, count: int,
                         cancel_event: threading.Event,
                         notify: Optional[Callable[[dict], None]]) -> None:
         """
         Worker body for crack_password: tries every zero-padded numeric
-        password of `digits` length against the backup, using a thread pool
-        sized to the machine's CPU count. The PBKDF2 work inside
-        iphone-backup-decrypt is done in C (pycryptodome/fastpbkdf2) and
-        releases the GIL, so threads give a real speedup here without the
-        pickling / re-exec pitfalls multiprocessing has under PyInstaller.
+        password of `digits` length in the range [start, start + count)
+        against the backup, using a thread pool sized to the machine's CPU
+        count. The PBKDF2 work inside iphone-backup-decrypt is done in C
+        (pycryptodome/fastpbkdf2) and releases the GIL, so threads give a
+        real speedup here without the pickling / re-exec pitfalls
+        multiprocessing has under PyInstaller.
         """
         fmt = "{:0%dd}" % digits
         max_workers = max(1, os.cpu_count() or 4)
+        total = count
         tried = 0
         found: Optional[str] = None
         t0 = time.time()
@@ -516,7 +530,7 @@ class BackupManager:
                 **extra,
             })
 
-        candidates = (fmt.format(n) for n in range(total))
+        candidates = (fmt.format(n) for n in range(start, start + count))
         window = max_workers * 2
         executor = ThreadPoolExecutor(max_workers=max_workers)
         futures: dict = {}

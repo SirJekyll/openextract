@@ -177,11 +177,15 @@ class SidecarServer:
         udid = params["udid"]
         digits = params["digits"]
         backup_dir = params.get("backup_dir")
+        start = params.get("start", 0)
+        count = params.get("count")
 
         def _notify(event: dict) -> None:
             self.send_notification("crack_password.progress", event)
 
-        return self.backup_manager.crack_password(udid, digits, backup_dir=backup_dir, notify=_notify)
+        return self.backup_manager.crack_password(
+            udid, digits, backup_dir=backup_dir, start=start, count=count, notify=_notify
+        )
 
     def cancel_crack_password(self, params):
         job_id = params["job_id"]

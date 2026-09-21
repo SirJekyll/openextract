@@ -64,6 +64,23 @@ class TestCrackPasswordValidation(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertIn("Decryption library", result["error"])
 
+    def test_rejects_negative_start(self):
+        result = self.manager.crack_password("udid-1", 6, start=-1)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Invalid search range", result["error"])
+
+    def test_rejects_count_that_overruns_the_space(self):
+        # Block 9 (the last of ten 100k blocks) plus a count that reaches
+        # past 999999 should be rejected rather than silently clamped.
+        result = self.manager.crack_password("udid-1", 6, start=900_000, count=200_000)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Invalid search range", result["error"])
+
+    def test_rejects_zero_count(self):
+        result = self.manager.crack_password("udid-1", 6, start=0, count=0)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Invalid search range", result["error"])
+
 
 class TestCrackPasswordJob(unittest.TestCase):
 
@@ -170,6 +187,60 @@ class TestCrackPasswordJob(unittest.TestCase):
         result = self.manager.cancel_crack_password("does-not-exist")
         self.assertEqual(result, {"status": "not_found"})
 
+    def test_block_search_only_tries_candidates_in_range(self):
+        """A block search (start/count) should never see candidates outside its range."""
+        seen: list = []
+        seen_lock = threading.Lock()
+
+        def _record_and_reject(backup_dir, password):
+            with seen_lock:
+                seen.append(password)
+            return False
+
+        with (
+            patch.object(
+                self.manager, "_resolve_backup_dir_info",
+                return_value=({"encrypted": True}, "/tmp/some-backup"),
+            ),
+            patch.object(backup_mod, "HAS_DECRYPT", True),
+            patch.object(backup_mod.BackupManager, "_try_password", staticmethod(_record_and_reject)),
+        ):
+            # Block 3 of ten 100,000-code blocks: 300000-399999.
+            result = self.manager.crack_password(
+                "udid-1", 6, start=300_000, count=100_000, notify=self._notify,
+            )
+            self.assertEqual(result["status"], "started")
+            self.assertEqual(result["total"], 100_000)
+            self.assertTrue(_wait_for(lambda: self._events_by_phase("done"), timeout=15.0))
+
+        done = self._events_by_phase("done")[0]
+        self.assertEqual(done["tried"], 100_000)
+        self.assertEqual(len(seen), 100_000)
+        self.assertTrue(all(p.startswith("3") for p in seen))
+        self.assertEqual(min(seen), "300000")
+        self.assertEqual(max(seen), "399999")
+
+    def test_block_search_finds_match_within_its_range(self):
+        with (
+            patch.object(
+                self.manager, "_resolve_backup_dir_info",
+                return_value=({"encrypted": True}, "/tmp/some-backup"),
+            ),
+            patch.object(backup_mod, "HAS_DECRYPT", True),
+            patch.object(
+                backup_mod.BackupManager, "_try_password",
+                staticmethod(lambda backup_dir, password: password == "712345"),
+            ),
+        ):
+            self.manager.crack_password(
+                "udid-1", 6, start=700_000, count=100_000, notify=self._notify,
+            )
+            self.assertTrue(_wait_for(lambda: self._events_by_phase("done"), timeout=15.0))
+
+        done = self._events_by_phase("done")[0]
+        self.assertTrue(done["found"])
+        self.assertEqual(done["password"], "712345")
+
 
 class TestCrackPasswordRpcRouting(unittest.TestCase):
     """Verify main.py's SidecarServer wires crack_password / cancel_crack_password."""
@@ -212,8 +283,28 @@ class TestCrackPasswordRpcRouting(unittest.TestCase):
         call_kwargs = server.backup_manager.crack_password.call_args
         self.assertEqual(call_kwargs.args, ("udid-1", 4))
         self.assertEqual(call_kwargs.kwargs["backup_dir"], "/tmp/x")
+        self.assertEqual(call_kwargs.kwargs["start"], 0)
+        self.assertIsNone(call_kwargs.kwargs["count"])
         self.assertTrue(callable(call_kwargs.kwargs["notify"]))
         self.assertEqual(result["result"]["job_id"], "abc")
+
+    def test_crack_password_passes_through_block_range(self):
+        from unittest.mock import MagicMock
+        server = self._make_server()
+        server.backup_manager = MagicMock()
+        server.backup_manager.crack_password.return_value = {
+            "status": "started", "job_id": "abc", "total": 100_000,
+        }
+
+        server.handle_request({
+            "id": 3,
+            "method": "crack_password",
+            "params": {"udid": "udid-1", "digits": 6, "start": 300_000, "count": 100_000},
+        })
+
+        call_kwargs = server.backup_manager.crack_password.call_args
+        self.assertEqual(call_kwargs.kwargs["start"], 300_000)
+        self.assertEqual(call_kwargs.kwargs["count"], 100_000)
 
     def test_cancel_crack_password_delegates(self):
         from unittest.mock import MagicMock
