@@ -15,7 +15,6 @@ What stays in openextract:
     ``get_manifest_db`` public method that ``photos.py`` calls.
 """
 
-import itertools
 import os
 import sys
 import json
@@ -443,19 +442,11 @@ class BackupManager:
             return False
 
     def crack_password(self, udid: str, digits: int, backup_dir: Optional[str] = None,
-                        pattern: Optional[str] = None,
                         notify: Optional[Callable[[dict], None]] = None) -> dict:
         """
-        Start a background brute-force search over all-numeric passwords of
-        the given length (4 or 6 digits) for an encrypted backup — useful for
-        recovering a forgotten iOS numeric backup passcode.
-
-        If `pattern` is given, it must be `digits` characters of '0'-'9' (a
-        digit the user remembers) and '*' (an unknown digit to search over) —
-        e.g. "1*3**6" for a 6-digit code where only 3 of the 6 digits are
-        known. This shrinks the search space to 10 ** (number of '*'s)
-        instead of the full 10 ** digits, since the known digits are held
-        fixed in their positions.
+        Start a background brute-force search over every all-numeric password
+        of the given length (4 or 6 digits) for an encrypted backup — useful
+        for recovering a forgotten iOS numeric backup passcode.
 
         Returns immediately with a job_id; progress and the eventual result
         are streamed through `notify` (one dict per event, see _run_crack_job)
@@ -464,15 +455,6 @@ class BackupManager:
         """
         if digits not in (4, 6):
             return {"status": "error", "error": "Only 4 or 6 digit codes are supported"}
-
-        if pattern is not None:
-            if len(pattern) != digits or any(c not in "0123456789*" for c in pattern):
-                return {
-                    "status": "error",
-                    "error": f"Pattern must be {digits} characters, using only digits 0-9 and * for unknown",
-                }
-            if "*" not in pattern:
-                return {"status": "error", "error": "Pattern has no unknown digits to search for"}
 
         info, backup_dir = self._resolve_backup_dir_info(udid, backup_dir)
         if not info:
@@ -483,13 +465,13 @@ class BackupManager:
             return {"status": "error", "error": "Decryption library not installed"}
 
         job_id = uuid.uuid4().hex
-        total = 10 ** (pattern.count("*") if pattern else digits)
+        total = 10 ** digits
         cancel_event = threading.Event()
         self._crack_jobs[job_id] = {"cancel": cancel_event}
 
         thread = threading.Thread(
             target=self._run_crack_job,
-            args=(job_id, backup_dir, digits, pattern, total, cancel_event, notify),
+            args=(job_id, backup_dir, digits, total, cancel_event, notify),
             daemon=True,
         )
         thread.start()
@@ -504,28 +486,18 @@ class BackupManager:
         job["cancel"].set()
         return {"status": "cancelling"}
 
-    @staticmethod
-    def _pattern_candidates(pattern: str):
-        """Yield every candidate matching `pattern`, filling '*' positions with 0-9."""
-        wild_positions = [i for i, c in enumerate(pattern) if c == "*"]
-        chars = list(pattern)
-        for combo in itertools.product("0123456789", repeat=len(wild_positions)):
-            for pos, digit in zip(wild_positions, combo):
-                chars[pos] = digit
-            yield "".join(chars)
-
-    def _run_crack_job(self, job_id: str, backup_dir: str, digits: int, pattern: Optional[str],
-                        total: int, cancel_event: threading.Event,
+    def _run_crack_job(self, job_id: str, backup_dir: str, digits: int, total: int,
+                        cancel_event: threading.Event,
                         notify: Optional[Callable[[dict], None]]) -> None:
         """
         Worker body for crack_password: tries every zero-padded numeric
-        password of `digits` length (or, if `pattern` is set, every value
-        matching it) against the backup, using a thread pool sized to the
-        machine's CPU count. The PBKDF2 work inside iphone-backup-decrypt is
-        done in C (pycryptodome/fastpbkdf2) and releases the GIL, so threads
-        give a real speedup here without the pickling / re-exec pitfalls
-        multiprocessing has under PyInstaller.
+        password of `digits` length against the backup, using a thread pool
+        sized to the machine's CPU count. The PBKDF2 work inside
+        iphone-backup-decrypt is done in C (pycryptodome/fastpbkdf2) and
+        releases the GIL, so threads give a real speedup here without the
+        pickling / re-exec pitfalls multiprocessing has under PyInstaller.
         """
+        fmt = "{:0%dd}" % digits
         max_workers = max(1, os.cpu_count() or 4)
         tried = 0
         found: Optional[str] = None
@@ -544,11 +516,7 @@ class BackupManager:
                 **extra,
             })
 
-        if pattern:
-            candidates = self._pattern_candidates(pattern)
-        else:
-            fmt = "{:0%dd}" % digits
-            candidates = (fmt.format(n) for n in range(total))
+        candidates = (fmt.format(n) for n in range(total))
         window = max_workers * 2
         executor = ThreadPoolExecutor(max_workers=max_workers)
         futures: dict = {}

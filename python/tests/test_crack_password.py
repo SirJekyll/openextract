@@ -64,52 +64,6 @@ class TestCrackPasswordValidation(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertIn("Decryption library", result["error"])
 
-    def test_rejects_pattern_wrong_length(self):
-        result = self.manager.crack_password("udid-1", 6, pattern="123")
-        self.assertEqual(result["status"], "error")
-        self.assertIn("6 characters", result["error"])
-
-    def test_rejects_pattern_with_invalid_characters(self):
-        result = self.manager.crack_password("udid-1", 6, pattern="12345X")
-        self.assertEqual(result["status"], "error")
-        self.assertIn("6 characters", result["error"])
-
-    def test_rejects_pattern_with_no_wildcards(self):
-        result = self.manager.crack_password("udid-1", 6, pattern="123456")
-        self.assertEqual(result["status"], "error")
-        self.assertIn("no unknown digits", result["error"])
-
-    def test_pattern_total_reflects_wildcard_count(self):
-        with (
-            patch.object(
-                self.manager, "_resolve_backup_dir_info",
-                return_value=({"encrypted": True}, "/tmp/some-backup"),
-            ),
-            patch.object(backup_mod, "HAS_DECRYPT", True),
-            patch.object(backup_mod.BackupManager, "_try_password", staticmethod(lambda d, p: False)),
-        ):
-            result = self.manager.crack_password("udid-1", 6, pattern="1*3**6")
-        self.assertEqual(result["status"], "started")
-        self.assertEqual(result["total"], 1000)  # 3 wildcards -> 10**3
-        self.manager.cancel_crack_password(result["job_id"])
-
-
-class TestPatternCandidates(unittest.TestCase):
-
-    def test_holds_fixed_digits_and_covers_all_wildcards(self):
-        candidates = list(BackupManager._pattern_candidates("1*3**6"))
-        self.assertEqual(len(candidates), 1000)  # 3 wildcards
-        self.assertEqual(len(set(candidates)), 1000)  # all unique
-        for c in candidates:
-            self.assertEqual(len(c), 6)
-            self.assertEqual(c[0], "1")
-            self.assertEqual(c[2], "3")
-            self.assertEqual(c[5], "6")
-
-    def test_no_wildcards_yields_single_candidate(self):
-        candidates = list(BackupManager._pattern_candidates("123456"))
-        self.assertEqual(candidates, ["123456"])
-
 
 class TestCrackPasswordJob(unittest.TestCase):
 
@@ -154,31 +108,6 @@ class TestCrackPasswordJob(unittest.TestCase):
         self.assertEqual(done["password"], "4242")
         # The job should have cleaned itself up.
         self.assertNotIn(job_id, self.manager._crack_jobs)
-
-    def test_pattern_search_only_tries_matching_candidates_and_finds_match(self):
-        """A pattern search should hold known digits fixed and still find a match."""
-        with (
-            patch.object(
-                self.manager, "_resolve_backup_dir_info",
-                return_value=({"encrypted": True}, "/tmp/some-backup"),
-            ),
-            patch.object(backup_mod, "HAS_DECRYPT", True),
-            patch.object(
-                backup_mod.BackupManager, "_try_password",
-                # Would only match if the search space were the full 10**6 —
-                # proves the pattern's fixed digits are actually being held.
-                staticmethod(lambda backup_dir, password: password == "193942"),
-            ),
-        ):
-            result = self.manager.crack_password("udid-1", 6, pattern="1*39*2", notify=self._notify)
-            self.assertEqual(result["status"], "started")
-            self.assertEqual(result["total"], 100)  # 2 wildcards -> 10**2
-            self.assertTrue(_wait_for(lambda: self._events_by_phase("done")))
-
-        done = self._events_by_phase("done")[0]
-        self.assertTrue(done["found"])
-        self.assertEqual(done["password"], "193942")
-        self.assertLessEqual(done["tried"], 100)
 
     def test_reports_not_found_when_no_match(self):
         """A search where no candidate matches should finish with found=False."""
