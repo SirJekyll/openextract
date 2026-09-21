@@ -20,10 +20,13 @@ import sys
 import json
 import plistlib
 import tempfile
+import threading
 import time
+import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from ios_backup_core.backup import (
     LocalBackupAccessor,
@@ -126,6 +129,8 @@ class BackupManager:
 
     def __init__(self):
         self._open_backups: dict[str, OpenBackup] = {}
+        # Tracks in-flight crack_password jobs: job_id -> {"cancel": Event}.
+        self._crack_jobs: dict[str, dict] = {}
 
     def _get_default_backup_dirs(self) -> list[str]:
         """Return platform-specific default backup locations."""
@@ -377,14 +382,14 @@ class BackupManager:
             "info": backup_info,
         }
 
-    def validate_password(self, udid: str, password: str,
-                          backup_dir: Optional[str] = None) -> dict:
-        """Fast check: is this passphrase correct for the encrypted backup?
+    def _resolve_backup_dir_info(self, udid: str, backup_dir: Optional[str]
+                                  ) -> tuple[Optional[dict], Optional[str]]:
+        """Resolve (info, backup_dir) for a udid, given an optional hint dir.
 
-        Only decrypts the keybag / manifest — does NOT create an OpenBackup or
-        prewarm any files, so it returns in under a second.
+        Same resolution logic used by validate_password and crack_password:
+        trust an explicit backup_dir (scanning one level deep if it's the
+        parent folder), otherwise fall back to scanning default locations.
         """
-        # Resolve the backup directory (same logic as open_backup fast-path)
         if backup_dir and os.path.isdir(backup_dir):
             info = self._read_backup_info(backup_dir)
             if not info:
@@ -401,6 +406,16 @@ class BackupManager:
                     info = b
                     backup_dir = b["backup_dir"]
                     break
+        return info, backup_dir
+
+    def validate_password(self, udid: str, password: str,
+                          backup_dir: Optional[str] = None) -> dict:
+        """Fast check: is this passphrase correct for the encrypted backup?
+
+        Only decrypts the keybag / manifest — does NOT create an OpenBackup or
+        prewarm any files, so it returns in under a second.
+        """
+        info, backup_dir = self._resolve_backup_dir_info(udid, backup_dir)
 
         if not info:
             return {"valid": False, "error": "Backup not found"}
@@ -416,6 +431,129 @@ class BackupManager:
             return {"valid": True}
         except Exception:
             return {"valid": False, "error": "Incorrect password"}
+
+    @staticmethod
+    def _try_password(backup_dir: str, password: str) -> bool:
+        """Return True iff `password` unlocks the encrypted backup at backup_dir."""
+        try:
+            open_local_backup(backup_dir, password=password)
+            return True
+        except Exception:
+            return False
+
+    def crack_password(self, udid: str, digits: int, backup_dir: Optional[str] = None,
+                        notify: Optional[Callable[[dict], None]] = None) -> dict:
+        """
+        Start a background brute-force search over every all-numeric password
+        of the given length (4 or 6 digits) for an encrypted backup — useful
+        for recovering a forgotten iOS numeric backup passcode.
+
+        Returns immediately with a job_id; progress and the eventual result
+        are streamed through `notify` (one dict per event, see _run_crack_job)
+        rather than blocking this call, so the RPC loop stays responsive and
+        the search can be cancelled via cancel_crack_password().
+        """
+        if digits not in (4, 6):
+            return {"status": "error", "error": "Only 4 or 6 digit codes are supported"}
+
+        info, backup_dir = self._resolve_backup_dir_info(udid, backup_dir)
+        if not info:
+            return {"status": "error", "error": "Backup not found"}
+        if not info.get("encrypted"):
+            return {"status": "error", "error": "Backup is not encrypted"}
+        if not HAS_DECRYPT:
+            return {"status": "error", "error": "Decryption library not installed"}
+
+        job_id = uuid.uuid4().hex
+        total = 10 ** digits
+        cancel_event = threading.Event()
+        self._crack_jobs[job_id] = {"cancel": cancel_event}
+
+        thread = threading.Thread(
+            target=self._run_crack_job,
+            args=(job_id, backup_dir, digits, total, cancel_event, notify),
+            daemon=True,
+        )
+        thread.start()
+
+        return {"status": "started", "job_id": job_id, "total": total}
+
+    def cancel_crack_password(self, job_id: str) -> dict:
+        """Signal a running crack_password job to stop as soon as possible."""
+        job = self._crack_jobs.get(job_id)
+        if not job:
+            return {"status": "not_found"}
+        job["cancel"].set()
+        return {"status": "cancelling"}
+
+    def _run_crack_job(self, job_id: str, backup_dir: str, digits: int, total: int,
+                        cancel_event: threading.Event,
+                        notify: Optional[Callable[[dict], None]]) -> None:
+        """
+        Worker body for crack_password: tries every zero-padded numeric
+        password of `digits` length against the backup, using a thread pool
+        sized to the machine's CPU count. The PBKDF2 work inside
+        iphone-backup-decrypt is done in C (pycryptodome/fastpbkdf2) and
+        releases the GIL, so threads give a real speedup here without the
+        pickling / re-exec pitfalls multiprocessing has under PyInstaller.
+        """
+        fmt = "{:0%dd}" % digits
+        max_workers = max(1, os.cpu_count() or 4)
+        tried = 0
+        found: Optional[str] = None
+        t0 = time.time()
+        last_notify = 0.0
+
+        def _emit(phase: str, **extra) -> None:
+            if not notify:
+                return
+            notify({
+                "job_id": job_id,
+                "phase": phase,
+                "tried": tried,
+                "total": total,
+                "elapsed_s": round(time.time() - t0, 1),
+                **extra,
+            })
+
+        candidates = (fmt.format(n) for n in range(total))
+        window = max_workers * 2
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures: dict = {}
+        try:
+            def _fill() -> None:
+                while len(futures) < window:
+                    try:
+                        candidate = next(candidates)
+                    except StopIteration:
+                        return
+                    futures[executor.submit(self._try_password, backup_dir, candidate)] = candidate
+
+            _fill()
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    candidate = futures.pop(future)
+                    tried += 1
+                    if future.result():
+                        found = candidate
+                if found or cancel_event.is_set():
+                    break
+                _fill()
+                now = time.time()
+                if now - last_notify >= 0.5:
+                    _emit("running")
+                    last_notify = now
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._crack_jobs.pop(job_id, None)
+
+        if found:
+            _emit("done", found=True, password=found)
+        elif cancel_event.is_set():
+            _emit("done", found=False, cancelled=True)
+        else:
+            _emit("done", found=False)
 
     def get_backup_size(self, backup_dir: str) -> dict:
         """

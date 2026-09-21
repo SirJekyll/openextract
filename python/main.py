@@ -7,6 +7,7 @@ JSON-RPC server communicating over stdin/stdout with the Electron main process.
 import os
 import sys
 import json
+import threading
 import time
 import tempfile
 
@@ -60,12 +61,19 @@ class SidecarServer:
         self.device_backup_manager = DeviceBackupManager()
         self.stats_computer = StatsComputer()
 
+        # crack_password runs its search on a background thread and streams
+        # progress via notifications, so stdout writes can now be interleaved
+        # between that thread and the main request/response loop below.
+        self._io_lock = threading.Lock()
+
         # Method dispatch table
         self.methods = {
             "ping": self.ping,
             "list_backups": self.list_backups,
             "open_backup": self.open_backup,
             "validate_password": self.validate_password,
+            "crack_password": self.crack_password,
+            "cancel_crack_password": self.cancel_crack_password,
             "get_backup_size": self.get_backup_size,
             "list_conversations": self.list_conversations,
             "get_messages": self.get_messages,
@@ -120,8 +128,10 @@ class SidecarServer:
         the backup RPC call is still in progress.
         """
         notification = {"jsonrpc": "2.0", "method": method, "params": params}
-        _rpc_out.write(json.dumps(notification) + "\n")
-        _rpc_out.flush()
+        line = json.dumps(notification) + "\n"
+        with self._io_lock:
+            _rpc_out.write(line)
+            _rpc_out.flush()
 
     # ── RPC method handlers ───────────────────────────────────────────────────
 
@@ -155,6 +165,27 @@ class SidecarServer:
         password = params["password"]
         backup_dir = params.get("backup_dir")
         return self.backup_manager.validate_password(udid, password, backup_dir=backup_dir)
+
+    def crack_password(self, params):
+        """
+        Start a brute-force search over all-numeric 4- or 6-digit passwords
+        for an encrypted backup. Returns immediately with a job_id; progress
+        and the final result are streamed as "crack_password.progress"
+        notifications (see backup.BackupManager._run_crack_job for the
+        payload shape).
+        """
+        udid = params["udid"]
+        digits = params["digits"]
+        backup_dir = params.get("backup_dir")
+
+        def _notify(event: dict) -> None:
+            self.send_notification("crack_password.progress", event)
+
+        return self.backup_manager.crack_password(udid, digits, backup_dir=backup_dir, notify=_notify)
+
+    def cancel_crack_password(self, params):
+        job_id = params["job_id"]
+        return self.backup_manager.cancel_crack_password(job_id)
 
     def get_backup_size(self, params):
         backup_dir = params["backup_dir"]
@@ -502,13 +533,15 @@ class SidecarServer:
                     "id": None,
                     "error": {"code": -32700, "message": f"Parse error: {e}"},
                 }
-                _rpc_out.write(json.dumps(response) + "\n")
-                _rpc_out.flush()
+                with self._io_lock:
+                    _rpc_out.write(json.dumps(response) + "\n")
+                    _rpc_out.flush()
                 continue
 
             response = self.handle_request(request)
-            _rpc_out.write(json.dumps(response) + "\n")
-            _rpc_out.flush()
+            with self._io_lock:
+                _rpc_out.write(json.dumps(response) + "\n")
+                _rpc_out.flush()
 
 
 if __name__ == "__main__":

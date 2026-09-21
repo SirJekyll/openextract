@@ -167,6 +167,8 @@ export default function App() {
 
       {pendingOpen && (
         <PasswordDialog
+          udid={pendingOpen.udid}
+          backupDir={pendingOpen.backupDir}
           deviceName={pendingOpen.deviceName}
           error={passwordError}
           loading={unlocking}
